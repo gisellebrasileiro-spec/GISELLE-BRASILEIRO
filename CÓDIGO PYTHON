@@ -1,447 +1,280 @@
-BLOCO 1 — SEMANA 3 (RSS + Sentimento baseline) → gera agg
+# pipeline_validacao_temporal_3tickers.py
+# Modelo didatico para Colab: treino/validacao/teste cronologicos.
+# Use o token BRAPI como segredo BRAPI_TOKEN, nunca o publique.
 
-python
+import getpass
+import json
+import math
+import re
+import xml.etree.ElementTree as ET
 
-content_copydownload
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score, precision_score,
+    recall_score, roc_auc_score,
+)
+from sklearn.preprocessing import StandardScaler
 
-1!pip install -q pandas requests
-2
-3import pandas as pd
-4import requests
-5import xml.etree.ElementTree as ET
-6from urllib.parse import quote
-7import re
-8import unicodedata
-9
-10TICKERS = ["ITUB4", "PETR4", "VALE3"]
-11
-12QUERIES = {
-13    "ITUB4": "Itaú Unibanco OR ITUB4",
-14    "PETR4": "Petrobras OR PETR4",
-15    "VALE3": "Vale S.A. OR VALE3 mineração"
-16}
-17
-18def google_news_rss(query, hl="pt-BR", gl="BR", ceid="BR:pt-419"):
-19    q = quote(query)
-20    url = f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
-21    r = requests.get(url, timeout=30)
-22    r.raise_for_status()
-23    return r.text
-24
-25def parse_rss(xml_text, ticker):
-26    root = ET.fromstring(xml_text)
-27    channel = root.find("channel")
-28    items = channel.findall("item") if channel is not None else []
-29    rows = []
-30    for it in items:
-31        title = (it.findtext("title") or "").strip()
-32        link = (it.findtext("link") or "").strip()
-33        pubDate = (it.findtext("pubDate") or "").strip()
-34        source_el = it.find("source")
-35        source = (source_el.text or "").strip() if source_el is not None else ""
-36        dt = pd.to_datetime(pubDate, errors="coerce")
-37        rows.append({
-38            "ticker": ticker,
-39            "datetime": dt,
-40            "headline": title,
-41            "source": source,
-42            "url": link,
-43            "query": QUERIES[ticker]
-44        })
-45    return rows
-46
-47# 1) Coleta RSS
-48rows = []
-49for t in TICKERS:
-50    xml_text = google_news_rss(QUERIES[t])
-51    part = parse_rss(xml_text, t)
-52    rows.extend(part)
-53    print("OK:", t, "| noticias:", len(part))
-54
-55df_news = pd.DataFrame(rows).drop_duplicates(subset=["ticker","headline","url"]).reset_index(drop=True)
-56print("\nTotal de noticias (RSS):", len(df_news))
-57display(df_news.head(10))
-58
-59# 2) Sentimento baseline (lexicon simples)
-60def normalize_text(s):
-61    if not isinstance(s, str):
-62        s = ""
-63    s = s.lower()
-64    s = "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
-65    s = re.sub(r"[^a-z0-9\s]", " ", s)
-66    s = re.sub(r"\s+", " ", s).strip()
-67    return s
-68
-69POS = {
-70    "alta","subiu","subir","ganho","ganhos","lucro","lucros","recorde","crescimento","melhora","positivo",
-71    "otimista","expansao","valorizacao","valorizou","avanco","avancou","supera","superou","forte"
-72}
-73NEG = {
-74    "queda","caiu","cair","perda","perdas","prejuizo","prejuizos","fraude","crise","negativo","pessimista",
-75    "recuo","recuou","despenca","despencou","investigacao","multa","risco","pressao","fraco","piora"
-76}
-77
-78def sentiment_score(text):
-79    txt = normalize_text(text)
-80    if txt == "":
-81        return 0.0, 0, 0
-82    tokens = txt.split()
-83    pos_count = sum(1 for w in tokens if w in POS)
-84    neg_count = sum(1 for w in tokens if w in NEG)
-85    denom = max(1, len(tokens))
-86    score = (pos_count - neg_count) / denom
-87    return float(score), int(pos_count), int(neg_count)
-88
-89df_sent = df_news.copy()
-90df_sent["text"] = df_sent["headline"].fillna("").astype(str)
-91
-92scores = df_sent["text"].apply(sentiment_score)
-93df_sent["sentiment_score"] = scores.apply(lambda x: x[0])
-94df_sent["pos_words"] = scores.apply(lambda x: x[1])
-95df_sent["neg_words"] = scores.apply(lambda x: x[2])
-96
-97def label(score, thr=0.002):
-98    if score > thr: return "POS"
-99    if score < -thr: return "NEG"
-100    return "NEU"
-101
-102df_sent["sentiment_label"] = df_sent["sentiment_score"].apply(label)
-103df_sent["date"] = pd.to_datetime(df_sent["datetime"], errors="coerce").dt.date
-104
-105# 3) Agregação diária -> agg
-106agg = df_sent.groupby(["ticker","date"]).agg(
-107    news_count=("headline","count"),
-108    sentiment_mean=("sentiment_score","mean"),
-109    sentiment_median=("sentiment_score","median"),
-110    pos_pct=("sentiment_label", lambda s: (s=="POS").mean()),
-111    neg_pct=("sentiment_label", lambda s: (s=="NEG").mean())
-112).reset_index().sort_values(["ticker","date"]).reset_index(drop=True)
-113
-114print("\nagg (previa):")
-115display(agg.head(20))
-116
+# ---------------- Configuracao ----------------
+TICKERS = ["ITUB4", "PETR4", "VALE3"]
+BRAPI_BASE = "https://brapi.dev/api"
+PRICE_RANGE = "1y"
+PRICE_INTERVAL = "1d"
+RSS_LANG = "pt-BR"
+RSS_COUNTRY = "BR"
+RSS_ITEMS_PER_TICKER = 30
+HORIZON_DAYS = 5
+RET_THRESHOLD = 0.005
+FILTER_NEUTRAL = False
+FEE_PER_TRADE = 0.0005
+TRAIN_FRAC = 0.60
+VALIDATION_FRAC = 0.20
+RANDOM_STATE = 42
+BUY_GRID = [0.55, 0.60, 0.65]
+SELL_GRID = [0.45, 0.40, 0.35]
+POS_WORDS = {"alta", "subiu", "ganho", "lucro", "melhora", "positivo", "supera", "forte", "avança"}
+NEG_WORDS = {"queda", "caiu", "perda", "prejuízo", "recuo", "piora", "negativo", "risco", "crise"}
 
-BLOCO 2 — SEMANA 4 (BRAPI + indicadores + merge) → gera df_final e df_ml
 
-python
+def get_brapi_token():
+    # Colab: crie um segredo chamado BRAPI_TOKEN. Localmente, sera solicitado.
+    try:
+        from google.colab import userdata
+        token = userdata.get("BRAPI_TOKEN")
+        if token:
+            return token
+    except Exception:
+        pass
+    return getpass.getpass("Informe o token BRAPI (nao sera exibido): ")
 
-content_copydownload
 
-1!pip install -q pandas numpy requests
-2
-3import pandas as pd
-4import numpy as np
-5import requests
-6
-7BRAPI_TOKEN = "7QTyw1F7kvDtRNfLRGcyif"
-8TICKERS = ["ITUB4", "PETR4", "VALE3"]
-9
-10print("TICKERS usados na Semana 4:", TICKERS)
-11
-12def brapi_history(ticker, range_str="5y", interval="1d", token=""):
-13    url = f"https://brapi.dev/api/quote/{ticker}"
-14    params = {"range": range_str, "interval": interval, "token": token}
-15    r = requests.get(url, params=params, timeout=30)
-16    r.raise_for_status()
-17    js = r.json()
-18    msg = js.get("message", "")
-19    if isinstance(msg, str) and msg.strip():
-20        raise RuntimeError(msg)
-21
-22    results = js.get("results", [])
-23    if not isinstance(results, list) or len(results) == 0:
-24        return pd.DataFrame()
-25
-26    hist = results[0].get("historicalDataPrice", [])
-27    if not isinstance(hist, list) or len(hist) == 0:
-28        return pd.DataFrame()
-29
-30    df = pd.DataFrame(hist)
-31    df.columns = [c.lower() for c in df.columns]
-32    df["date"] = pd.to_datetime(df["date"], unit="s", errors="coerce")
-33    df = df.dropna(subset=["date"]).sort_values("date").set_index("date")
-34
-35    for c in ["open","high","low","close","volume"]:
-36        if c not in df.columns:
-37            df[c] = np.nan
-38    return df[["open","high","low","close","volume"]].copy()
-39
-40def sma(s, window): return s.rolling(window=window).mean()
-41def ema(s, span): return s.ewm(span=span, adjust=False).mean()
-42
-43def rsi(close, period=14):
-44    delta = close.diff()
-45    gain = delta.where(delta > 0, 0.0)
-46    loss = (-delta).where(delta < 0, 0.0)
-47    avg_gain = gain.rolling(window=period).mean()
-48    avg_loss = loss.rolling(window=period).mean()
-49    rs = avg_gain / avg_loss.replace(0, np.nan)
-50    return 100 - (100 / (1 + rs))
-51
-52def macd(close, fast=12, slow=26, signal=9):
-53    fast_ema = ema(close, fast)
-54    slow_ema = ema(close, slow)
-55    macd_line = fast_ema - slow_ema
-56    signal_line = ema(macd_line, signal)
-57    hist = macd_line - signal_line
-58    return macd_line, signal_line, hist
-59
-60def bollinger(close, window=20, n_std=2):
-61    mid = sma(close, window)
-62    std = close.rolling(window=window).std()
-63    upper = mid + n_std * std
-64    lower = mid - n_std * std
-65    return mid, upper, lower
-66
-67if "agg" not in globals():
-68    raise RuntimeError("Nao encontrei agg. Rode o BLOCO 1 antes.")
-69
-70price_rows = []
-71for t in TICKERS:
-72    dfp = brapi_history(t, "5y", "1d", BRAPI_TOKEN)
-73    print("BRAPI:", t, "| linhas:", len(dfp))
-74
-75    dfp = dfp.copy()
-76    dfp["ticker"] = t
-77    dfp["date"] = dfp.index.date
-78
-79    close = dfp["close"]
-80    dfp["sma_20"] = sma(close, 20)
-81    dfp["sma_50"] = sma(close, 50)
-82    dfp["ema_12"] = ema(close, 12)
-83    dfp["rsi_14"] = rsi(close, 14)
-84    dfp["macd"], dfp["macd_signal"], dfp["macd_hist"] = macd(close, 12, 26, 9)
-85    dfp["bb_mid"], dfp["bb_upper"], dfp["bb_lower"] = bollinger(close, 20, 2)
-86
-87    dfp["ret_1d"] = np.log(dfp["close"] / dfp["close"].shift(1))
-88    dfp["target_ret_1d_next"] = dfp["ret_1d"].shift(-1)
-89    dfp["target_up_next"] = (dfp["target_ret_1d_next"] > 0).astype(int)
-90
-91    price_rows.append(dfp)
-92
-93df_feat_price = pd.concat(price_rows, axis=0).reset_index(drop=True)
-94print("\nTickers em df_feat_price:", sorted(df_feat_price["ticker"].unique()))
-95display(df_feat_price.groupby("ticker").size())
-96
-97df_final = df_feat_price.merge(agg.copy(), on=["ticker","date"], how="left")
-98df_final["news_count"] = df_final["news_count"].fillna(0).astype(int)
-99df_final["sentiment_mean"] = df_final["sentiment_mean"].fillna(0.0)
-100df_final["sentiment_median"] = df_final["sentiment_median"].fillna(0.0)
-101df_final["pos_pct"] = df_final["pos_pct"].fillna(0.0)
-102df_final["neg_pct"] = df_final["neg_pct"].fillna(0.0)
-103
-104print("\nTickers em df_final:", sorted(df_final["ticker"].unique()))
-105display(df_final.groupby("ticker").size())
-106
-107# df_ml permissivo (garante 3 tickers)
-108must_have = [
-109    "ticker","date","close","ret_1d",
-110    "target_ret_1d_next","target_up_next",
-111    "sma_20","sma_50","ema_12","rsi_14",
-112    "macd","macd_signal","macd_hist",
-113    "bb_upper","bb_lower",
-114    "news_count","sentiment_mean"
-115]
-116df_ml = df_final.dropna(subset=must_have).copy()
-117print("\ndf_ml linhas:", len(df_ml))
-118print("df_ml por ticker:")
-119display(df_ml.groupby("ticker").size())
-120
+BRAPI_TOKEN = get_brapi_token()
 
-BLOCO 3 — COMPARAÇÃO: Classificação vs Regressão + Backtest moderado com custo (gera tabelas finais)
 
-python
+def brapi_quote_historical(ticker):
+    url = f"{BRAPI_BASE}/quote/{ticker}"
+    params = {"range": PRICE_RANGE, "interval": PRICE_INTERVAL, "token": BRAPI_TOKEN}
+    response = requests.get(url, params=params, timeout=60)
+    response.raise_for_status()
+    results = response.json().get("results", [])
+    if not results:
+        return pd.DataFrame()
+    history = results[0].get("historicalDataPrice", [])
+    if not history:
+        return pd.DataFrame()
+    df = pd.DataFrame(history)
+    if "date" not in df or "close" not in df:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], unit="s").dt.date
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["close"])[["date", "close"]].copy()
+    df["ticker"] = ticker
+    return df.sort_values("date").reset_index(drop=True)
 
-content_copydownload
 
-1!pip install -q scikit-learn matplotlib
-2
-3import numpy as np
-4import pandas as pd
-5import matplotlib.pyplot as plt
-6
-7from sklearn.preprocessing import StandardScaler
-8from sklearn.linear_model import LogisticRegression, Ridge
-9from sklearn.metrics import (
-10    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score, confusion_matrix,
-11    mean_absolute_error, mean_squared_error, r2_score
-12)
-13
-14if "df_ml" not in globals():
-15    raise RuntimeError("Nao encontrei df_ml. Rode o BLOCO 2 antes.")
-16
-17df = df_ml.copy()
-18df["date"] = pd.to_datetime(df["date"], errors="coerce")
-19df = df.dropna(subset=["date"]).sort_values(["ticker","date"]).reset_index(drop=True)
-20
-21candidate_features = [
-22    "ret_1d",
-23    "sma_20", "sma_50",
-24    "ema_12",
-25    "rsi_14",
-26    "macd", "macd_signal", "macd_hist",
-27    "bb_mid", "bb_upper", "bb_lower",
-28    "volume",
-29    "news_count", "sentiment_mean", "sentiment_median", "pos_pct", "neg_pct"
-30]
-31features = [c for c in candidate_features if c in df.columns]
-32df = df.dropna(subset=features + ["target_up_next","target_ret_1d_next","close"]).copy()
-33
-34# Split por ticker (80/20)
-35train_parts, test_parts = [], []
-36for t in df["ticker"].unique():
-37    dft = df[df["ticker"] == t].sort_values("date").reset_index(drop=True)
-38    cut = int(len(dft) * 0.8)
-39    train_parts.append(dft.iloc[:cut])
-40    test_parts.append(dft.iloc[cut:])
-41
-42train = pd.concat(train_parts, axis=0).reset_index(drop=True)
-43test  = pd.concat(test_parts, axis=0).reset_index(drop=True)
-44
-45X_train = train[features].astype(float)
-46X_test  = test[features].astype(float)
-47
-48scaler = StandardScaler()
-49X_train_sc = scaler.fit_transform(X_train)
-50X_test_sc  = scaler.transform(X_test)
-51
-52# -------- Classificacao --------
-53y_train_cls = train["target_up_next"].astype(int)
-54y_test_cls  = test["target_up_next"].astype(int)
-55
-56clf = LogisticRegression(max_iter=1000)
-57clf.fit(X_train_sc, y_train_cls)
-58
-59p_up = clf.predict_proba(X_test_sc)[:, 1]
-60y_pred_cls = (p_up >= 0.5).astype(int)
-61
-62acc = accuracy_score(y_test_cls, y_pred_cls)
-63f1 = f1_score(y_test_cls, y_pred_cls, zero_division=0)
-64prec = precision_score(y_test_cls, y_pred_cls, zero_division=0)
-65rec = recall_score(y_test_cls, y_pred_cls, zero_division=0)
-66try:
-67    auc = roc_auc_score(y_test_cls, p_up)
-68except Exception:
-69    auc = np.nan
-70
-71cm = confusion_matrix(y_test_cls, y_pred_cls)
-72
-73print("Matriz de confusao (classificacao):")
-74print(cm)
-75print("\nMetricas classificacao:")
-76print("Accuracy:", acc)
-77print("F1:", f1)
-78print("Precision:", prec)
-79print("Recall:", rec)
-80print("ROC-AUC:", auc)
-81
-82# -------- Regressao --------
-83y_train_reg = train["target_ret_1d_next"].astype(float)
-84y_test_reg  = test["target_ret_1d_next"].astype(float)
-85
-86reg = Ridge(alpha=1.0)
-87reg.fit(X_train_sc, y_train_reg)
-88
-89y_pred_reg = reg.predict(X_test_sc)
-90
-91mae = mean_absolute_error(y_test_reg, y_pred_reg)
-92rmse = mean_squared_error(y_test_reg, y_pred_reg) ** 0.5
-93r2 = r2_score(y_test_reg, y_pred_reg)
-94
-95# Regressao como classificador (sinal do retorno previsto)
-96y_pred_reg_cls = (y_pred_reg > 0).astype(int)
-97acc_reg_as_cls = accuracy_score(y_test_cls, y_pred_reg_cls)
-98f1_reg_as_cls = f1_score(y_test_cls, y_pred_reg_cls, zero_division=0)
-99
-100df_compare = pd.DataFrame([
-101    {"model":"Classificacao (LogReg)", "accuracy":acc, "f1":f1, "precision":prec, "recall":rec, "roc_auc":auc, "mae":np.nan, "rmse":np.nan, "r2":np.nan},
-102    {"model":"Regressao (Ridge)", "accuracy":acc_reg_as_cls, "f1":f1_reg_as_cls, "precision":np.nan, "recall":np.nan, "roc_auc":np.nan, "mae":mae, "rmse":rmse, "r2":r2},
-103])
-104print("\nComparacao de metricas:")
-105display(df_compare)
-106
-107# -------- Backtest moderado + custo --------
-108bt = test[["ticker","date","close","ret_1d"]].copy()
-109bt = bt.sort_values(["ticker","date"]).reset_index(drop=True)
-110bt["ret_1d"] = bt["ret_1d"].fillna(0.0)
-111bt["p_up"] = p_up
-112bt["ret_pred"] = y_pred_reg
-113
-114buy_thr, sell_thr = 0.53, 0.47
-115buy_ret, sell_ret = 0.0010, -0.0010
-116fee_per_trade = 0.0005
-117
-118def make_pos(series_signal, buy_level, sell_level):
-119    pos = 0
-120    out = []
-121    for v in series_signal:
-122        v = float(v)
-123        if v >= buy_level:
-124            pos = 1
-125        elif v <= sell_level:
-126            pos = 0
-127        out.append(pos)
-128    return out
-129
-130pos_cls, pos_reg = [], []
-131for t in bt["ticker"].unique():
-132    dft = bt[bt["ticker"] == t].reset_index(drop=True)
-133    pos_cls.extend(make_pos(dft["p_up"], buy_thr, sell_thr))
-134    pos_reg.extend(make_pos(dft["ret_pred"], buy_ret, sell_ret))
-135
-136bt["pos_cls"] = pos_cls
-137bt["pos_reg"] = pos_reg
-138
-139bt["trade_cls"] = bt.groupby("ticker")["pos_cls"].diff().fillna(0).abs()
-140bt["trade_reg"] = bt.groupby("ticker")["pos_reg"].diff().fillna(0).abs()
-141
-142bt["fee_cls"] = bt["trade_cls"] * fee_per_trade
-143bt["fee_reg"] = bt["trade_reg"] * fee_per_trade
-144
-145bt["ret_cls"] = bt["pos_cls"] * bt["ret_1d"] - bt["fee_cls"]
-146bt["ret_reg"] = bt["pos_reg"] * bt["ret_1d"] - bt["fee_reg"]
-147bt["ret_bh"]  = bt["ret_1d"]
-148
-149summary = []
-150for t in bt["ticker"].unique():
-151    dft = bt[bt["ticker"] == t].copy()
-152    dft["cum_cls"] = np.exp(dft["ret_cls"].cumsum())
-153    dft["cum_reg"] = np.exp(dft["ret_reg"].cumsum())
-154    dft["cum_bh"]  = np.exp(dft["ret_bh"].cumsum())
-155
-156    dft["peak_cls"] = dft["cum_cls"].cummax()
-157    dft["dd_cls"] = dft["cum_cls"] / dft["peak_cls"] - 1.0
-158    dft["peak_reg"] = dft["cum_reg"].cummax()
-159    dft["dd_reg"] = dft["cum_reg"] / dft["peak_reg"] - 1.0
-160
-161    summary.append({
-162        "ticker": t,
-163        "period_start": str(pd.to_datetime(dft["date"]).min().date()),
-164        "period_end": str(pd.to_datetime(dft["date"]).max().date()),
-165        "days": int(len(dft)),
-166        "final_cls": float(dft["cum_cls"].iloc[-1]),
-167        "final_reg": float(dft["cum_reg"].iloc[-1]),
-168        "final_buy_hold": float(dft["cum_bh"].iloc[-1]),
-169        "max_dd_cls": float(dft["dd_cls"].min()),
-170        "max_dd_reg": float(dft["dd_reg"].min()),
-171        "trades_cls_approx": int(dft["trade_cls"].sum()),
-172        "trades_reg_approx": int(dft["trade_reg"].sum())
-173    })
-174
-175    plt.figure(figsize=(8,3))
-176    plt.plot(pd.to_datetime(dft["date"]), dft["cum_cls"], label="Classificacao (moderado+custo)")
-177    plt.plot(pd.to_datetime(dft["date"]), dft["cum_reg"], label="Regressao (moderado+custo)")
-178    plt.plot(pd.to_datetime(dft["date"]), dft["cum_bh"],  label="Buy&Hold")
-179    plt.title(f"Backtest comparativo - {t}")
-180    plt.legend()
-181    plt.tight_layout()
-182    plt.show()
-183
-184df_bt_compare_moderado = pd.DataFrame(summary).sort_values("ticker").reset_index(drop=True)
-185display(df_bt_compare_moderado)
-186
-187print("\nParametros:")
-188print("buy_thr/sell_thr:", buy_thr, "/", sell_thr)
-189print("buy_ret/sell_ret:", buy_ret, "/", sell_ret)
-190print("fee_per_trade:", fee_per_trade)
-191
+def rss_url(query):
+    q = requests.utils.quote(query)
+    ceid = f"{RSS_COUNTRY}:pt-419"
+    return f"https://news.google.com/rss/search?q={q}&hl={RSS_LANG}&gl={RSS_COUNTRY}&ceid={ceid}"
+
+
+def parse_rss(xml_text):
+    rows = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return pd.DataFrame(columns=["title", "description", "pubDate", "link"])
+    for item in root.findall(".//item"):
+        pub_text = item.findtext("pubDate", default="")
+        try:
+            pub_date = pd.to_datetime(pub_text, utc=True).date()
+        except Exception:
+            pub_date = None
+        rows.append({
+            "title": item.findtext("title", default=""),
+            "description": item.findtext("description", default=""),
+            "pubDate": pub_date,
+            "link": item.findtext("link", default=""),
+        })
+    return pd.DataFrame(rows)
+
+
+def simple_sentiment_pt(text):
+    cleaned = re.sub(r"[^a-zA-ZÀ-ÿ0-9 ]+", " ", str(text).lower())
+    words = [word for word in cleaned.split() if len(word) > 2]
+    positive = sum(word in POS_WORDS for word in words)
+    negative = sum(word in NEG_WORDS for word in words)
+    score = (positive - negative) / max(1, positive + negative)
+    label = "POS" if score > 0.10 else "NEG" if score < -0.10 else "NEU"
+    return label, float(score)
+
+
+def news_features(ticker):
+    response = requests.get(rss_url(ticker), timeout=60)
+    response.raise_for_status()
+    news = parse_rss(response.text).dropna(subset=["pubDate"]).copy()
+    news = news.iloc[:RSS_ITEMS_PER_TICKER].copy()
+    if news.empty:
+        return pd.DataFrame(columns=["date", "news_count", "sentiment_mean"])
+    news["sentiment_score"] = [
+        simple_sentiment_pt(str(r.title) + " " + str(r.description))[1]
+        for r in news.itertuples()
+    ]
+    news["date"] = news["pubDate"]
+    return news.groupby("date", as_index=False).agg(
+        news_count=("link", "count"), sentiment_mean=("sentiment_score", "mean")
+    )
+
+
+def rsi(close, window=14):
+    delta = close.diff()
+    up = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+    down = (-delta).clip(lower=0).rolling(window, min_periods=window).mean()
+    rs = up / (down + 1e-9)
+    return 100 - 100 / (1 + rs)
+
+
+def build_features_targets(price_df):
+    df = price_df.copy().sort_values("date").reset_index(drop=True)
+    df["ret_1d"] = df["close"].pct_change()
+    df["sma_10"] = df["close"].rolling(10, min_periods=10).mean()
+    df["rsi_14"] = rsi(df["close"], 14)
+    df["future_ret_H"] = df["close"].shift(-HORIZON_DAYS) / df["close"] - 1
+    # Futuro ausente permanece NaN e sera removido, nao classificado como queda.
+    df["target_up_H"] = np.nan
+    has_future = df["future_ret_H"].notna()
+    df.loc[has_future, "target_up_H"] = (df.loc[has_future, "future_ret_H"] > RET_THRESHOLD).astype(int)
+    if FILTER_NEUTRAL:
+        df = df[df["future_ret_H"].abs() > RET_THRESHOLD].copy()
+    return df
+
+
+def backtest_next_day(df, buy_thr, sell_thr, invert=False):
+    # Sinal calculado em t aplicado ao retorno de t para t+1.
+    data = df.sort_values("date").reset_index(drop=True).copy()
+    data["next_return"] = data["close"].shift(-1) / data["close"] - 1
+    data = data.dropna(subset=["next_return"])
+    position, equity, trades = 0, 1.0, 0
+    for row in data.itertuples():
+        probability = float(row.p_up)
+        if invert:
+            probability = 1.0 - probability
+        next_position = position
+        if probability >= buy_thr:
+            next_position = 1
+        elif probability <= sell_thr:
+            next_position = 0
+        if next_position != position:
+            equity *= 1.0 - FEE_PER_TRADE
+            trades += 1
+        if next_position == 1:
+            equity *= 1.0 + float(row.next_return)
+        position = next_position
+    buy_hold = float(np.prod(1.0 + data["next_return"].to_numpy(dtype=float))) if len(data) else None
+    return {"final_strategy": float(equity), "final_buy_hold": buy_hold,
+            "trades_approx": int(trades), "n_returns": int(len(data))}
+
+
+def safe_auc(y, scores):
+    if len(np.unique(y)) < 2:
+        return None
+    try:
+        value = float(roc_auc_score(y, scores))
+        return value if math.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def choose_thresholds(validation):
+    best = None
+    for invert in [False, True]:
+        for buy in BUY_GRID:
+            for sell in SELL_GRID:
+                if sell >= buy:
+                    continue
+                bt = backtest_next_day(validation, buy, sell, invert)
+                if best is None or bt["final_strategy"] > best["validation_strategy"]:
+                    best = {"invert_signal": bool(invert), "buy_thr": float(buy),
+                            "sell_thr": float(sell), "validation_strategy": bt["final_strategy"],
+                            "validation_buy_hold": bt["final_buy_hold"],
+                            "validation_trades": bt["trades_approx"]}
+    return best
+
+
+def run_one_ticker(ticker):
+    prices = brapi_quote_historical(ticker)
+    if prices.empty:
+        return {"error": "A fonte nao retornou precos para este ticker."}
+    news = news_features(ticker)
+    df = build_features_targets(prices).merge(news, on="date", how="left")
+    df["news_count"] = df["news_count"].fillna(0.0)
+    df["sentiment_mean"] = df["sentiment_mean"].fillna(0.0)
+    features = ["ret_1d", "sma_10", "rsi_14", "news_count", "sentiment_mean"]
+    df = df.dropna(subset=features + ["target_up_H"]).copy()
+    if len(df) < 80:
+        return {"error": f"Poucas linhas validas ({len(df)}); tente PRICE_RANGE='2y'."}
+    df["target_up_H"] = df["target_up_H"].astype(int)
+    n = len(df)
+    train_cut = int(math.floor(n * TRAIN_FRAC))
+    val_cut = int(math.floor(n * (TRAIN_FRAC + VALIDATION_FRAC)))
+    # Purga H linhas antes de cada nova janela para reduzir sobreposicao de targets.
+    train = df.iloc[:train_cut - HORIZON_DAYS].copy()
+    validation = df.iloc[train_cut:val_cut - HORIZON_DAYS].copy()
+    test = df.iloc[val_cut:].copy()
+    if min(len(train), len(validation), len(test)) < 20:
+        return {"error": "Bloco temporal pequeno apos a purga; tente PRICE_RANGE='2y'."}
+    if train["target_up_H"].nunique() < 2:
+        return {"error": "Treino contem apenas uma classe do target."}
+    scaler = StandardScaler()
+    x_train = scaler.fit_transform(train[features].to_numpy(dtype=float))
+    x_val = scaler.transform(validation[features].to_numpy(dtype=float))
+    x_test = scaler.transform(test[features].to_numpy(dtype=float))
+    model = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
+    model.fit(x_train, train["target_up_H"].to_numpy(dtype=int))
+    p_val = model.predict_proba(x_val)[:, 1]
+    p_test = model.predict_proba(x_test)[:, 1]
+    val_bt = validation[["date", "close"]].copy()
+    val_bt["p_up"] = p_val
+    rule = choose_thresholds(val_bt)
+    y_test = test["target_up_H"].to_numpy(dtype=int)
+    predicted = (p_test >= 0.5).astype(int)
+    test_bt = test[["date", "close"]].copy()
+    test_bt["p_up"] = p_test
+    final_bt = backtest_next_day(test_bt, rule["buy_thr"], rule["sell_thr"], rule["invert_signal"])
+    return {
+        "parameters": {"horizon_days": HORIZON_DAYS, "ret_threshold": RET_THRESHOLD,
+                       "price_range": PRICE_RANGE, "rss_items_limit": RSS_ITEMS_PER_TICKER,
+                       "train_rows": len(train), "validation_rows": len(validation), "test_rows": len(test)},
+        "test_metrics": {"accuracy": float(accuracy_score(y_test, predicted)),
+                         "precision": float(precision_score(y_test, predicted, zero_division=0)),
+                         "recall": float(recall_score(y_test, predicted, zero_division=0)),
+                         "f1": float(f1_score(y_test, predicted, zero_division=0)),
+                         "roc_auc": safe_auc(y_test, p_test),
+                         "roc_auc_inverted": safe_auc(y_test, 1-p_test),
+                         "confusion_matrix": confusion_matrix(y_test, predicted, labels=[0,1]).tolist()},
+        "rule_selected_on_validation": rule,
+        "test_backtest": final_bt,
+        "interpretation_note": "Simulacao historica; target H dias e backtest diario devem ser alinhados antes de conclusao definitiva."
+    }
+
+
+def run():
+    outputs = {}
+    for ticker in TICKERS:
+        print(f"Processando {ticker}...")
+        try:
+            outputs[ticker] = run_one_ticker(ticker)
+        except requests.RequestException:
+            outputs[ticker] = {"error": "Falha de comunicacao com uma fonte de dados; confira rede, credencial e disponibilidade."}
+        except Exception as exc:
+            outputs[ticker] = {"error": "Erro inesperado no processamento.", "detail": str(exc)}
+    print("RESULTS_JSON=")
+    print(json.dumps(outputs, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    run()
+
