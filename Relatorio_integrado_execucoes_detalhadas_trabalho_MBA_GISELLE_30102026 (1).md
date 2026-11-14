@@ -1,5 +1,5 @@
-PROJETO FINAL — BI MASTER (PUC-Rio)
-
+Indicadores técnicos e sentimento de notícias para sinais de negociação: um experimento com validação temporal
+ 
 Como o código foi construído, por que as escolhas foram feitas e o que os resultados significam
 
 Relatório detalhado em linguagem acessível, atualizado com a execução temporal compartilhada pela autora.
@@ -362,3 +362,6 @@ Adicionar custos realistas, liquidez e regras operacionais antes de qualquer int
 Remover token do código compartilhável e manter segredo no ambiente.
 
 Apresentar fatores e métricas como resultados históricos do experimento, não como promessa futura.
+
+Trabalhos futuros:
+Os resultados obtidos não demonstraram superioridade consistente em relação ao Buy & Hold, mas o experimento evidenciou limitações específicas cuja correção pode melhorar o desempenho e, principalmente, a confiabilidade da avaliação. Como trabalhos futuros, propõe-se: (i) alinhar o horizonte do alvo ao período de exposição do backtest; (ii) ampliar o histórico e adotar validação walk-forward com múltiplas janelas; (iii) construir uma base histórica de notícias coerente com todo o período analisado; (iv) substituir o sentimento lexical simples por métodos que considerem contexto, como léxicos financeiros ou modelos de linguagem; (v) realizar ablação para medir a contribuição isolada das notícias; (vi) comparar a Regressão Logística com outros classificadores e baselines ingênuos; e (vii) incorporar custos operacionais realistas e métricas de risco, como Sharpe e drawdown máximo.
