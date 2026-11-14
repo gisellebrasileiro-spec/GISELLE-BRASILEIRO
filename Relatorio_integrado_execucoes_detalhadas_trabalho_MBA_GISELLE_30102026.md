@@ -362,3 +362,5 @@ Adicionar custos realistas, liquidez e regras operacionais antes de qualquer int
 Remover token do código compartilhável e manter segredo no ambiente.
 
 Apresentar fatores e métricas como resultados históricos do experimento, não como promessa futura.
+
+Os resultados obtidos não demonstraram superioridade consistente em relação ao Buy & Hold, mas o experimento evidenciou limitações específicas cuja correção pode melhorar o desempenho e, principalmente, a confiabilidade da avaliação. Como trabalhos futuros, propõe-se: (i) alinhar o horizonte do alvo ao período de exposição do backtest; (ii) ampliar o histórico e adotar validação walk-forward com múltiplas janelas; (iii) construir uma base histórica de notícias coerente com todo o período analisado; (iv) substituir o sentimento lexical simples por métodos que considerem contexto, como léxicos financeiros ou modelos de linguagem; (v) realizar ablação para medir a contribuição isolada das notícias; (vi) comparar a Regressão Logística com outros classificadores e baselines ingênuos; e (vii) incorporar custos operacionais realistas e métricas de risco, como Sharpe e drawdown máximo.
