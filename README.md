@@ -1,4 +1,5 @@
 Indicadores técnicos e sentimento de notícias para sinais de negociação: um experimento com validação temporal
+
 Como o código foi construído, por que as escolhas foram feitas e o que os resultados significam
 Relatório detalhado em linguagem acessível, atualizado com a execução temporal compartilhada pela autora.
 
