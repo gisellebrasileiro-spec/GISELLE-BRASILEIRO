@@ -1,0 +1,279 @@
+# pipeline_validacao_temporal_3tickers.py
+# Modelo didatico para Colab: treino/validacao/teste cronologicos.
+# Use o token BRAPI como segredo BRAPI_TOKEN, nunca o publique.
+
+import getpass
+import json
+import math
+import re
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, confusion_matrix, f1_score, precision_score,
+    recall_score, roc_auc_score,
+)
+from sklearn.preprocessing import StandardScaler
+
+# ---------------- Configuracao ----------------
+TICKERS = ["ITUB4", "PETR4", "VALE3"]
+BRAPI_BASE = "https://brapi.dev/api"
+PRICE_RANGE = "1y"
+PRICE_INTERVAL = "1d"
+RSS_LANG = "pt-BR"
+RSS_COUNTRY = "BR"
+RSS_ITEMS_PER_TICKER = 30
+HORIZON_DAYS = 5
+RET_THRESHOLD = 0.005
+FILTER_NEUTRAL = False
+FEE_PER_TRADE = 0.0005
+TRAIN_FRAC = 0.60
+VALIDATION_FRAC = 0.20
+RANDOM_STATE = 42
+BUY_GRID = [0.55, 0.60, 0.65]
+SELL_GRID = [0.45, 0.40, 0.35]
+POS_WORDS = {"alta", "subiu", "ganho", "lucro", "melhora", "positivo", "supera", "forte", "avança"}
+NEG_WORDS = {"queda", "caiu", "perda", "prejuízo", "recuo", "piora", "negativo", "risco", "crise"}
+
+
+def get_brapi_token():
+    # Colab: crie um segredo chamado BRAPI_TOKEN. Localmente, sera solicitado.
+    try:
+        from google.colab import userdata
+        token = userdata.get("BRAPI_TOKEN")
+        if token:
+            return token
+    except Exception:
+        pass
+    return getpass.getpass("Informe o token BRAPI (nao sera exibido): ")
+
+
+BRAPI_TOKEN = get_brapi_token()
+
+
+def brapi_quote_historical(ticker):
+    url = f"{BRAPI_BASE}/quote/{ticker}"
+    params = {"range": PRICE_RANGE, "interval": PRICE_INTERVAL, "token": BRAPI_TOKEN}
+    response = requests.get(url, params=params, timeout=60)
+    response.raise_for_status()
+    results = response.json().get("results", [])
+    if not results:
+        return pd.DataFrame()
+    history = results[0].get("historicalDataPrice", [])
+    if not history:
+        return pd.DataFrame()
+    df = pd.DataFrame(history)
+    if "date" not in df or "close" not in df:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"], unit="s").dt.date
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["close"])[["date", "close"]].copy()
+    df["ticker"] = ticker
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def rss_url(query):
+    q = requests.utils.quote(query)
+    ceid = f"{RSS_COUNTRY}:pt-419"
+    return f"https://news.google.com/rss/search?q={q}&hl={RSS_LANG}&gl={RSS_COUNTRY}&ceid={ceid}"
+
+
+def parse_rss(xml_text):
+    rows = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return pd.DataFrame(columns=["title", "description", "pubDate", "link"])
+    for item in root.findall(".//item"):
+        pub_text = item.findtext("pubDate", default="")
+        try:
+            pub_date = pd.to_datetime(pub_text, utc=True).date()
+        except Exception:
+            pub_date = None
+        rows.append({
+            "title": item.findtext("title", default=""),
+            "description": item.findtext("description", default=""),
+            "pubDate": pub_date,
+            "link": item.findtext("link", default=""),
+        })
+    return pd.DataFrame(rows)
+
+
+def simple_sentiment_pt(text):
+    cleaned = re.sub(r"[^a-zA-ZÀ-ÿ0-9 ]+", " ", str(text).lower())
+    words = [word for word in cleaned.split() if len(word) > 2]
+    positive = sum(word in POS_WORDS for word in words)
+    negative = sum(word in NEG_WORDS for word in words)
+    score = (positive - negative) / max(1, positive + negative)
+    label = "POS" if score > 0.10 else "NEG" if score < -0.10 else "NEU"
+    return label, float(score)
+
+
+def news_features(ticker):
+    response = requests.get(rss_url(ticker), timeout=60)
+    response.raise_for_status()
+    news = parse_rss(response.text).dropna(subset=["pubDate"]).copy()
+    news = news.iloc[:RSS_ITEMS_PER_TICKER].copy()
+    if news.empty:
+        return pd.DataFrame(columns=["date", "news_count", "sentiment_mean"])
+    news["sentiment_score"] = [
+        simple_sentiment_pt(str(r.title) + " " + str(r.description))[1]
+        for r in news.itertuples()
+    ]
+    news["date"] = news["pubDate"]
+    return news.groupby("date", as_index=False).agg(
+        news_count=("link", "count"), sentiment_mean=("sentiment_score", "mean")
+    )
+
+
+def rsi(close, window=14):
+    delta = close.diff()
+    up = delta.clip(lower=0).rolling(window, min_periods=window).mean()
+    down = (-delta).clip(lower=0).rolling(window, min_periods=window).mean()
+    rs = up / (down + 1e-9)
+    return 100 - 100 / (1 + rs)
+
+
+def build_features_targets(price_df):
+    df = price_df.copy().sort_values("date").reset_index(drop=True)
+    df["ret_1d"] = df["close"].pct_change()
+    df["sma_10"] = df["close"].rolling(10, min_periods=10).mean()
+    df["rsi_14"] = rsi(df["close"], 14)
+    df["future_ret_H"] = df["close"].shift(-HORIZON_DAYS) / df["close"] - 1
+    # Futuro ausente permanece NaN e sera removido, nao classificado como queda.
+    df["target_up_H"] = np.nan
+    has_future = df["future_ret_H"].notna()
+    df.loc[has_future, "target_up_H"] = (df.loc[has_future, "future_ret_H"] > RET_THRESHOLD).astype(int)
+    if FILTER_NEUTRAL:
+        df = df[df["future_ret_H"].abs() > RET_THRESHOLD].copy()
+    return df
+
+
+def backtest_next_day(df, buy_thr, sell_thr, invert=False):
+    # Sinal calculado em t aplicado ao retorno de t para t+1.
+    data = df.sort_values("date").reset_index(drop=True).copy()
+    data["next_return"] = data["close"].shift(-1) / data["close"] - 1
+    data = data.dropna(subset=["next_return"])
+    position, equity, trades = 0, 1.0, 0
+    for row in data.itertuples():
+        probability = float(row.p_up)
+        if invert:
+            probability = 1.0 - probability
+        next_position = position
+        if probability >= buy_thr:
+            next_position = 1
+        elif probability <= sell_thr:
+            next_position = 0
+        if next_position != position:
+            equity *= 1.0 - FEE_PER_TRADE
+            trades += 1
+        if next_position == 1:
+            equity *= 1.0 + float(row.next_return)
+        position = next_position
+    buy_hold = float(np.prod(1.0 + data["next_return"].to_numpy(dtype=float))) if len(data) else None
+    return {"final_strategy": float(equity), "final_buy_hold": buy_hold,
+            "trades_approx": int(trades), "n_returns": int(len(data))}
+
+
+def safe_auc(y, scores):
+    if len(np.unique(y)) < 2:
+        return None
+    try:
+        value = float(roc_auc_score(y, scores))
+        return value if math.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def choose_thresholds(validation):
+    best = None
+    for invert in [False, True]:
+        for buy in BUY_GRID:
+            for sell in SELL_GRID:
+                if sell >= buy:
+                    continue
+                bt = backtest_next_day(validation, buy, sell, invert)
+                if best is None or bt["final_strategy"] > best["validation_strategy"]:
+                    best = {"invert_signal": bool(invert), "buy_thr": float(buy),
+                            "sell_thr": float(sell), "validation_strategy": bt["final_strategy"],
+                            "validation_buy_hold": bt["final_buy_hold"],
+                            "validation_trades": bt["trades_approx"]}
+    return best
+
+
+def run_one_ticker(ticker):
+    prices = brapi_quote_historical(ticker)
+    if prices.empty:
+        return {"error": "A fonte nao retornou precos para este ticker."}
+    news = news_features(ticker)
+    df = build_features_targets(prices).merge(news, on="date", how="left")
+    df["news_count"] = df["news_count"].fillna(0.0)
+    df["sentiment_mean"] = df["sentiment_mean"].fillna(0.0)
+    features = ["ret_1d", "sma_10", "rsi_14", "news_count", "sentiment_mean"]
+    df = df.dropna(subset=features + ["target_up_H"]).copy()
+    if len(df) < 80:
+        return {"error": f"Poucas linhas validas ({len(df)}); tente PRICE_RANGE='2y'."}
+    df["target_up_H"] = df["target_up_H"].astype(int)
+    n = len(df)
+    train_cut = int(math.floor(n * TRAIN_FRAC))
+    val_cut = int(math.floor(n * (TRAIN_FRAC + VALIDATION_FRAC)))
+    # Purga H linhas antes de cada nova janela para reduzir sobreposicao de targets.
+    train = df.iloc[:train_cut - HORIZON_DAYS].copy()
+    validation = df.iloc[train_cut:val_cut - HORIZON_DAYS].copy()
+    test = df.iloc[val_cut:].copy()
+    if min(len(train), len(validation), len(test)) < 20:
+        return {"error": "Bloco temporal pequeno apos a purga; tente PRICE_RANGE='2y'."}
+    if train["target_up_H"].nunique() < 2:
+        return {"error": "Treino contem apenas uma classe do target."}
+    scaler = StandardScaler()
+    x_train = scaler.fit_transform(train[features].to_numpy(dtype=float))
+    x_val = scaler.transform(validation[features].to_numpy(dtype=float))
+    x_test = scaler.transform(test[features].to_numpy(dtype=float))
+    model = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)
+    model.fit(x_train, train["target_up_H"].to_numpy(dtype=int))
+    p_val = model.predict_proba(x_val)[:, 1]
+    p_test = model.predict_proba(x_test)[:, 1]
+    val_bt = validation[["date", "close"]].copy()
+    val_bt["p_up"] = p_val
+    rule = choose_thresholds(val_bt)
+    y_test = test["target_up_H"].to_numpy(dtype=int)
+    predicted = (p_test >= 0.5).astype(int)
+    test_bt = test[["date", "close"]].copy()
+    test_bt["p_up"] = p_test
+    final_bt = backtest_next_day(test_bt, rule["buy_thr"], rule["sell_thr"], rule["invert_signal"])
+    return {
+        "parameters": {"horizon_days": HORIZON_DAYS, "ret_threshold": RET_THRESHOLD,
+                       "price_range": PRICE_RANGE, "rss_items_limit": RSS_ITEMS_PER_TICKER,
+                       "train_rows": len(train), "validation_rows": len(validation), "test_rows": len(test)},
+        "test_metrics": {"accuracy": float(accuracy_score(y_test, predicted)),
+                         "precision": float(precision_score(y_test, predicted, zero_division=0)),
+                         "recall": float(recall_score(y_test, predicted, zero_division=0)),
+                         "f1": float(f1_score(y_test, predicted, zero_division=0)),
+                         "roc_auc": safe_auc(y_test, p_test),
+                         "roc_auc_inverted": safe_auc(y_test, 1-p_test),
+                         "confusion_matrix": confusion_matrix(y_test, predicted, labels=[0,1]).tolist()},
+        "rule_selected_on_validation": rule,
+        "test_backtest": final_bt,
+        "interpretation_note": "Simulacao historica; target H dias e backtest diario devem ser alinhados antes de conclusao definitiva."
+    }
+
+
+def run():
+    outputs = {}
+    for ticker in TICKERS:
+        print(f"Processando {ticker}...")
+        try:
+            outputs[ticker] = run_one_ticker(ticker)
+        except requests.RequestException:
+            outputs[ticker] = {"error": "Falha de comunicacao com uma fonte de dados; confira rede, credencial e disponibilidade."}
+        except Exception as exc:
+            outputs[ticker] = {"error": "Erro inesperado no processamento.", "detail": str(exc)}
+    print("RESULTS_JSON=")
+    print(json.dumps(outputs, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    run()
