@@ -1,6 +1,6 @@
 # README — Projeto Final BI MASTER (PUC-Rio)
 
-## Sistema de Apoio à Decisão para Compra e Venda de Ações da B3
+## Indicadores técnicos e sentimento de notícias para sinais de negociação: um experimento com validação temporal
 
 **Autora:** Giselle de Araujo Brasileiro  
 **Código:** `pipeline_validacao_temporal_3tickers.py`
