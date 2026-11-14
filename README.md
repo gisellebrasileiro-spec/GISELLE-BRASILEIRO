@@ -1,295 +1,66 @@
-# GISELLE-BRASILEIRO
-Projeto final BI MASTER: pipeline reprodutível no Colab integrando indicadores técnicos, notícias (RSS) e sentimento para prever direção/retorno (D+1) e comparar estratégias de trading via backtest.
-GISELLE-BRASILEIRO — SIAD para Compra/Venda de Ações (BRAPI + RSS + Sentimento + ML)
+# README — Projeto Final BI MASTER (PUC-Rio)
 
-Projeto final (BI MASTER/PUC-Rio) de um Sistema Inteligente de Apoio à Decisão (SIAD) para apoiar decisões de compra/venda de ações na B3 por meio de:
+## Sistema de Apoio à Decisão para Compra e Venda de Ações da B3
 
-Séries históricas de preços (OHLCV) via BRAPI
+**Autora:** Giselle de Araujo Brasileiro  
+**Código:** `pipeline_validacao_temporal_3tickers.py`
 
-Indicadores técnicos (SMA/EMA/RSI/MACD/Bollinger)
+> Projeto acadêmico e exploratório; não é recomendação financeira nem garantia de desempenho.
 
-Notícias financeiras via Google News RSS
+## 1. O que o projeto faz
 
-Análise de sentimento (baseline) por léxico (heurística) e agregação diária
+O programa usa preços históricos e notícias para construir indicadores, estimar a probabilidade de uma alta definida e simular uma regra de compra, saída ou manutenção. A regra é comparada com Buy & Hold: comprar no início e manter a ação. A versão foi aplicada a ITUB4, PETR4 e VALE3.
 
-Modelos de Machine Learning:
+## 2. Termos essenciais
 
-Classificação: prever se o retorno do dia seguinte será positivo (alta)
+| Termo | Significado simples |
+|---|---|
+| Feature | Informação numérica de entrada, como retorno, RSI ou notícias. |
+| Target | Resultado que o modelo tenta prever. |
+| Treino | Dados mais antigos usados para ajustar o modelo. |
+| Validação | Dados usados para escolher limiares e inversão. |
+| Teste | Dados posteriores usados para avaliar uma regra já escolhida. |
+| Threshold | Corte de probabilidade que muda a posição. |
+| Backtest | Simulação histórica, não operação real. |
+| Buy & Hold | Comprar no começo e manter até o fim. |
 
-Regressão: prever o retorno do dia seguinte
+## 3. Metodologia em linguagem acessível
 
-Backtest para comparar estratégias derivadas dos modelos vs Buy & Hold
+1. **Preços:** `brapi_quote_historical` solicita fechamentos diários à BRAPI (`PRICE_RANGE="1y"`, `PRICE_INTERVAL="1d"`), ordena as datas e verifica se há dados.
+2. **Notícias:** o código procura notícias pelo Google News RSS, tentando extrair título, descrição, data e link; considera até 30 itens por ticker.
+3. **Sentimento:** `simple_sentiment_pt` usa um vocabulário curto de palavras positivas e negativas. As contagens são resumidas por dia em `news_count` e `sentiment_mean`. É um baseline simples, incapaz de compreender contexto, ironia e negação; o RSS não é um arquivo histórico completo.
+4. **Features de preço:** `ret_1d` mede a variação diária; `sma_10` é a média dos últimos dez pregões; `rsi_14` resume movimentos recentes de alta/baixa.
+5. **Target:** `HORIZON_DAYS=5` e `RET_THRESHOLD=0.005`: classe positiva se o retorno até cinco pregões à frente superar 0,5%. Datas sem preço futuro conhecido são removidas. A purga na fronteira ajuda a evitar que o futuro de um bloco invada o próximo.
+6. **Divisão temporal:** 60% treino, 20% validação e 20% teste; sem embaralhar a sequência cronológica.
+7. **Modelo:** StandardScaler é ajustado no treino; regressão logística produz `p_up`.
+8. **Regra:** `buy_thr` abre posição, `sell_thr` zera posição e a faixa intermediária mantém a posição (HOLD). O grid inclui possibilidade de usar `1-p_up` (`invert_signal`).
+9. **Avaliação:** a regra é escolhida na validação e então congelada para o teste. O backtest revisado aplica o sinal de t ao retorno de t para t+1 e desconta `FEE_PER_TRADE=0.0005` em mudanças de posição.
 
-1. Objetivo
+## 4. Resultados da execução recente
 
-Construir um pipeline reprodutível que:
+Cada ticker teve 133 linhas de treino, 41 de validação e 46 de teste. O backtest contabilizou 45 retornos, pois requer um preço no dia seguinte.
 
-integre dados de preço e notícias;
+| Ativo | ROC-AUC | Matriz de confusão | Regra selecionada na validação | Estratégia no teste | Buy & Hold no teste | Trades |
+|---|---:|---|---|---:|---:|---:|
+| ITUB4 | 0.8442307692307692 | `[[14, 6], [9, 17]]` | sem inversão; buy 0.55; sell 0.45 | 1.075753936237348 | 1.258795934323691 | 4 |
+| PETR4 | 0.35902636916835695 | `[[4, 13], [13, 16]]` | invertida; buy 0.55; sell 0.4 | 1.3218431606508754 | 1.3611691022964503 | 4 |
+| VALE3 | 0.4054054054054054 | `[[0, 37], [0, 9]]` | invertida; buy 0.55; sell 0.45 | 1.0 | 0.8581727436572849 | 0 |
 
-transforme as informações em features;
+`final_strategy` e `final_buy_hold` são fatores começando em 1. ITUB4 e PETR4 ficaram abaixo de Buy & Hold. Em VALE3, o classificador apontou classe positiva em todas as observações e o backtest não abriu posição; fator 1.0 superou o benchmark durante uma queda, mas isso não é evidência de trades vencedores.
 
-treine modelos preditivos;
+## 5. Limitações metodológicas relevantes
 
-gere recomendações objetivas (COMPRA/NEUTRO/SAIR);
+- O target olha cinco pregões à frente, mas o backtest aplica o sinal ao retorno do próximo dia. É preciso alinhar esses horizontes para uma análise coerente.
+- Uma única divisão com 46 linhas de teste por ativo é pequena; recomenda-se walk-forward em várias datas.
+- O RSS é limitado, o sentimento é lexical e a cobertura histórica de notícias é incompleta.
+- O backtest não representa integralmente spread, slippage, liquidez e execução real.
+- Os resultados são históricos e não garantem comportamento futuro.
 
-avalie o impacto prático por meio de backtesting.
+## 6. Como replicar no Google Colab
 
-2. Universo de ativos
-
-Por limitações e instabilidades observadas durante a execução no Google Colab e validação de fontes públicas, o universo operacional final deste repositório ficou:
-
-ITUB4
-
-PETR4
-
-VALE3
-
-Observação: o projeto originalmente considerava 6 ativos com base em liquidez/movimentação, mas a disponibilidade de histórico consistente via APIs públicas no ambiente Colab exigiu ajustes para garantir reprodutibilidade.
-
-3. Fontes de dados
-
-3.1 Preços (BRAPI)
-
-Endpoint utilizado: https://brapi.dev/api/quote/{TICKER}?range=5y&interval=1d&token=...
-
-Dados extraídos: open, high, low, close, volume (OHLCV)
-
-Periodicidade: diária
-
-3.2 Notícias (Google News RSS)
-
-Fonte: RSS público do Google News por consulta:
-
-ITUB4: Itaú Unibanco OR ITUB4
-
-PETR4: Petrobras OR PETR4
-
-VALE3: Vale S.A. OR VALE3 mineração
-
-Retorno típico: ~100 itens por consulta (variável conforme relevância/atualidade)
-
-Campos usados: headline, datetime, source, url
-
-3.3 Por que não Finnhub (company-news)?
-
-Durante testes, o endpoint company-news retornou 403 Forbidden (restrição do plano/credenciais), e market-news não trouxe menções suficientes aos ativos brasileiros no lote analisado. Para não travar a etapa de notícias/sentimento, foi adotado Google News RSS como alternativa reprodutível sem chave.
-
-4. Definições do SIAD (alvos e decisões)
-
-4.1 Alvo de Classificação
-
-target_up_next:
-
-1 se o retorno do dia seguinte (D+1) for positivo
-
-0 caso contrário
-
-Esse alvo é diretamente interpretável como “probabilidade de alta amanhã” → útil para COMPRA/NEUTRO/SAIR.
-
-4.2 Alvo de Regressão
-
-target_ret_1d_next:
-
-retorno (log-return) do dia seguinte (D+1)
-
-Esse alvo permite decisões baseadas em magnitude do retorno previsto (com thresholds).
-
-5. Features
-
-5.1 Indicadores técnicos
-
-Calculados por ticker:
-
-SMA(20), SMA(50)
-
-EMA(12)
-
-RSI(14)
-
-MACD(12, 26, 9): macd, macd_signal, macd_hist
-
-Bollinger Bands(20, 2σ): bb_mid, bb_upper, bb_lower
-
-Retorno 1D: ret_1d
-
-Volume: volume
-
-5.2 Sentimento (baseline)
-
-Heurística por léxico (PT-BR), computando sentiment_score por notícia:
-
-positivo: palavras como “alta”, “lucro”, “recorde” etc.
-
-negativo: “queda”, “prejuízo”, “crise” etc.
-
-Agregação diária por ticker:
-
-news_count
-
-sentiment_mean, sentiment_median
-
-pos_pct, neg_pct
-
-Este baseline serve como referência (baseline) e permite comparar posteriormente com uma versão LLM (conforme recomendação da orientadora).
-
-6. Modelos
-
-6.1 Classificação — Regressão Logística (baseline)
-
-Padronização: StandardScaler
-
-Modelo: LogisticRegression
-
-Split temporal por ticker: 80% treino / 20% teste (sem vazamento)
-
-Métricas obtidas (teste):
-
-Accuracy: 0.49166666666666664
-
-F1: 0.5
-
-Precision: 0.5545454545454546
-
-Recall: 0.4552238805970149
-
-ROC-AUC: 0.5076895397227698
-
-Confusion matrix: [[171 147], [219 183]]
-
-6.2 Regressão — Ridge (baseline)
-
-Padronização: StandardScaler
-
-Modelo: Ridge
-
-A regressão é convertida em estratégia via thresholds no retorno previsto.
-
-7. Estratégias e Backtest
-
-7.1 Estratégia baseada em Classificação (probabilidade)
-
-O modelo produz p_up = probabilidade de alta no dia seguinte.
-
-Foi usada uma política de histerese (evita “churning”):
-
-COMPRA se p_up >= buy_thr
-
-ZERA se p_up <= sell_thr
-
-caso contrário: mantém posição anterior
-
-7.2 Estratégia baseada em Regressão (retorno previsto)
-
-A regressão produz ret_pred (retorno previsto D+1):
-
-COMPRA se ret_pred >= buy_ret
-
-ZERA se ret_pred <= sell_ret
-
-caso contrário: mantém posição anterior
-
-7.3 Comparação final com thresholds moderados + custo
-
-Parâmetros (moderado + custo):
-
-Classificação: buy_thr=0.53, sell_thr=0.47
-
-Regressão: buy_ret=0.0010, sell_ret=-0.0010
-
-Custo por trade: fee_per_trade=0.0005
-
-Período do backtest: 2025-09-15 a 2026-08-31 (240 dias)
-
-Resultados (valor acumulado final):
-
-ITUB4:
-
-final_cls: 0.885259
-
-final_reg: 1.426421
-
-buy&hold: 1.088966
-
-max_dd_cls: -0.240227
-
-max_dd_reg: -0.153273
-
-trades_cls: 1
-
-trades_reg: 10
-
-PETR4:
-
-final_cls: 1.451064
-
-final_reg: 1.312062
-
-buy&hold: 1.443874
-
-max_dd_cls: -0.241262
-
-max_dd_reg: -0.097180
-
-trades_cls: 1
-
-trades_reg: 12
-
-VALE3:
-
-final_cls: 1.025030
-
-final_reg: 1.172570
-
-buy&hold: 1.365789
-
-max_dd_cls: -0.042491
-
-max_dd_reg: -0.062190
-
-trades_cls: 2
-
-trades_reg: 6
-
-Interpretação: não houve um vencedor único. Com thresholds moderados e custo, a regressão foi superior em ITUB4 e VALE3; a classificação foi superior em PETR4 (ligeiramente acima do buy&hold). A avaliação final deve considerar retorno, drawdown e número de trades.
-
-8. Como executar (Google Colab)
-
-Recomendação: rodar em ordem:
-
-Semana 3 (RSS + sentimento) → gera agg
-
-Semana 4 (preços + indicadores + merge) → gera df_ml
-
-Semana 5 (classificação e regressão + backtests)
-
-Dependências
-
-pandas, numpy, requests, matplotlib
-
-scikit-learn
-
-Observação: no Colab, evite pip install -U pandas numpy pois pode quebrar compatibilidade do ambiente.
-
-9. Limitações conhecidas
-
-Dependência de fontes públicas sujeitas a instabilidade (BRAPI, RSS).
-
-Sentimento baseline por léxico é simples e não captura contexto/ironia; é uma referência para comparação futura com LLM.
-
-Backtest não inclui slippage realista; custo por trade é aproximado.
-
-10. Próximos passos recomendados
-
-Substituir sentimento baseline por LLM e comparar resultados (mesmo prompt) conforme recomendação da orientadora.
-
-Testar modelos alternativos (RandomForest, Gradient Boosting, XGBoost/LightGBM).
-
-Fazer calibração sistemática de thresholds (por percentis, otimização por métrica de risco).
-
-Incluir custos mais realistas (corretagem/spread) e regras de posicionamento (stop/take profit).
-
-Contato
-
-Aluna: Giselle de Araujo Brasileiro
-
-Projeto: BI MASTER / PUC-Rio
+1. Abra [Google Colab](https://colab.research.google.com/) e crie um notebook.
+2. Adicione o token BRAPI como segredo chamado `BRAPI_TOKEN`; não o publique em código, Word ou GitHub.
+3. Carregue ou cole `pipeline_validacao_temporal_3tickers.py`.
+4. Se necessário, instale `pandas`, `numpy`, `scikit-learn` e `requests`.
+5. Execute e salve `RESULTS_JSON`, parâmetros e data de execução.
+6. Confira os tamanhos dos blocos e erros antes de interpretar a saída.
